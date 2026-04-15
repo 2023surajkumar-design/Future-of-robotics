@@ -1,19 +1,24 @@
 """
-SO-101 MuJoCo Pick-and-Place — AUTONOMOUS DEPLOYMENT (v6.1 ROLLBACK + GRIP FIX)
+SO-101 MuJoCo Pick-and-Place — DYNAMIC DETECT & PICK (v8)
 
-This is a rollback to v6 (which had clean pick-place behavior) with ONE fix:
-- Cube reduced from 4cm to 3cm (half-size 0.015) so it fits between the 
-  gripper jaws without the mesh visually penetrating through it.
-- Cube-robot collision disabled during carry to prevent physics artifacts.
-- Collision re-enabled after release so cube sits properly on table.
-- Rotation locked to [1,0,0,0] — no spinning.
-- All velocities zeroed during carry — clean release.
+Major upgrade from v6.1:
+  - Cube spawns at a RANDOM position on the table each episode
+  - Arm SWEEPS shoulder_pan left→right to SEARCH for the cube
+  - Once detected (via camera + ground-truth pose), all waypoints
+    are solved dynamically via IK for the detected position
+  - Pick-place-return cycle, then a NEW random spawn, repeat forever
 
-Measured accuracy: ~5mm XY
+Architecture:
+  SPAWN → SWEEP_SCAN → DETECT → IK_SOLVE → PRE → GRAB → CLOSE → LIFT
+  → PAN_TO_PLACE → PLACE → RELEASE → RETURN → (loop)
+
+Reachable workspace (from diagnostic):
+  X: [0.10, 0.26], Y: [-0.18, 0.18], Pan: [-55°, 55°]
 """
 import os
 import time
 import math
+import random
 import numpy as np
 import cv2
 import mujoco
@@ -28,14 +33,22 @@ except ImportError:
 
 SCENE_XML_PATH = "/Users/udbhavkulkarni/Downloads/Future-of-robotics-main/physical-ai-challenge-2026/macos_pipeline/sim/robots/SO101/scene.xml"
 
-# Cube at X=0.20 — ahead of gripper approach path to avoid being pushed
-CUBE_START_POS = np.array([0.20, 0.0, 0.065])   # Z = table_top(0.05) + half(0.015)
+# Place target is always the green marker
 CUBE_PLACE_POS = np.array([0.18, -0.12, 0.065])
-CUBE_HALF_SIZE = 0.015  # 3cm cube — fits between gripper jaws
+CUBE_HALF_SIZE = 0.015  # 3cm cube
+
+# Spawn zone: anywhere on the table the arm can reach
+SPAWN_X_RANGE = (0.12, 0.25)
+SPAWN_Y_RANGE = (-0.16, 0.16)
+
+# Scan parameters
+SCAN_PAN_MIN = math.radians(-55)
+SCAN_PAN_MAX = math.radians(55)
+SCAN_SPEED = 0.0008  # rad/step — full sweep in ~2.4 seconds
 
 
 def solve_ik(model, data, site_id, target_pos, pan_hint=0.0):
-    """IK solver: [pan, s_lift, elbow, w_flex, w_roll] → gripperframe at target."""
+    """IK solver: find joint config so gripperframe reaches target_pos."""
     def cost(q):
         data.qpos[:5] = q
         mujoco.mj_kinematics(model, data)
@@ -48,17 +61,28 @@ def solve_ik(model, data, site_id, target_pos, pan_hint=0.0):
     return list(res.x)
 
 
+def random_spawn_pos():
+    """Generate a random cube position on the table within reach."""
+    x = random.uniform(*SPAWN_X_RANGE)
+    y = random.uniform(*SPAWN_Y_RANGE)
+    z = 0.05 + CUBE_HALF_SIZE  # table_top + half cube
+    return np.array([x, y, z])
+
+
 def create_simulation():
+    """Build scene with table, cube (random pos), and place marker."""
     print(f"[*] Loading SO-101 from: {SCENE_XML_PATH}")
     with open(SCENE_XML_PATH, "r") as f:
         xml_content = f.read()
 
+    # Initial cube position (will be reset each episode)
+    init_pos = random_spawn_pos()
     hs = CUBE_HALF_SIZE
     injections = f"""
         <body name="table" pos="0.25 0 0.025">
             <geom type="box" size="0.2 0.2 0.025" rgba="0.6 0.6 0.6 1"/>
         </body>
-        <body name="red_cube" pos="{CUBE_START_POS[0]} {CUBE_START_POS[1]} {CUBE_START_POS[2]}">
+        <body name="red_cube" pos="{init_pos[0]} {init_pos[1]} {init_pos[2]}">
             <freejoint/>
             <geom name="cube_geom" type="box" size="{hs} {hs} {hs}"
                   rgba="1 0 0 1" mass="0.05" friction="2.0 0.1 0.001"/>
@@ -78,16 +102,19 @@ def create_simulation():
     return model, data
 
 
-def densefusion_6d_inference(model, data):
-    cube_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "red_cube")
-    return {"pos": np.copy(data.xpos[cube_id]),
-            "mat": np.copy(data.xmat[cube_id].reshape(3, 3))}
+def respawn_cube(data, cube_qpos_adr):
+    """Teleport cube to a new random position on the table."""
+    new_pos = random_spawn_pos()
+    data.qpos[cube_qpos_adr:cube_qpos_adr + 3] = new_pos
+    data.qpos[cube_qpos_adr + 3:cube_qpos_adr + 7] = [1, 0, 0, 0]  # upright
+    data.qvel[:] = 0  # zero everything
+    return new_pos
 
 
 def main():
-    print("=" * 58)
-    print("🤖  PHYSICAL AI HACKATHON 2026 — AUTONOMOUS PICK & PLACE")
-    print("=" * 58)
+    print("=" * 62)
+    print("🤖  PHYSICAL AI HACKATHON 2026 — DYNAMIC DETECT & PICK v8")
+    print("=" * 62)
 
     yolo_model = None
     if HAS_YOLO:
@@ -95,7 +122,7 @@ def main():
         try:
             yolo_model = YOLO("yolov8n.pt")
         except Exception as e:
-            print(f"[!] YOLOv8 failed: {e}")
+            print(f"[!] YOLOv8 load failed: {e}")
 
     model, data = create_simulation()
     renderer = mujoco.Renderer(model, 480, 640)
@@ -107,55 +134,25 @@ def main():
     cube_qpos = model.jnt_qposadr[cube_jnt]
     cube_dof = model.jnt_dofadr[cube_jnt]
 
-    # IK Solve
-    print("[*] Solving inverse kinematics...")
-    GRAB_J = solve_ik(model, data, site_id, CUBE_START_POS, 0.0)
-    PRE_J = solve_ik(model, data, site_id,
-                     [CUBE_START_POS[0] - 0.05, 0.0, CUBE_START_POS[2]], 0.0)
-    LIFT_J = solve_ik(model, data, site_id,
-                      [CUBE_START_POS[0], 0.0, 0.18], 0.0)
-    PLACE_J = solve_ik(model, data, site_id, CUBE_PLACE_POS, 0.8)
-    PLACE_LIFT_J = solve_ik(model, data, site_id,
-                            [CUBE_PLACE_POS[0], CUBE_PLACE_POS[1], 0.18], 0.8)
-    PLACE_PAN = PLACE_J[0]
+    # ─── STATE MACHINE ───
+    PHASE_SPAWN = "SPAWN"
+    PHASE_SCAN = "SCAN"
+    PHASE_WAYPOINTS = "WAYPOINTS"
+    PHASE_DONE = "EPISODE_DONE"
 
-    print(f"    GRAB:  {[f'{j:.3f}' for j in GRAB_J]}")
-    print(f"    PLACE: {[f'{j:.3f}' for j in PLACE_J]}")
-    print(f"    PAN:   {PLACE_PAN:.3f} rad ({math.degrees(PLACE_PAN):.1f}°)")
-
-    # Waypoint sequence (v6 architecture)
-    WAYPOINTS = [
-        ("NEUTRAL",       [0.0, 0.0, 0.0, 0.0, 0.0, 1.5],
-         False, 750, 1500, None),
-        ("PRE_APPROACH",  PRE_J + [1.5],
-         False, 750, 2500, None),
-        ("GRAB_ADVANCE",  GRAB_J + [1.5],
-         False, 1000, 2500, None),
-        ("CLOSE_GRIP",    GRAB_J + [-0.10],
-         True, 1000, 2000, None),
-        ("LIFT",          LIFT_J + [-0.10],
-         True, 750, 2500, None),
-        ("PAN_TO_PLACE",  [PLACE_PAN] + LIFT_J[1:] + [-0.10],
-         True, 1500, 2000, (0.0, PLACE_PAN, 1500)),
-        ("PLACE_LIFT",    PLACE_LIFT_J + [-0.10],
-         True, 1000, 2500, None),
-        ("PLACE_LOWER",   PLACE_J + [-0.10],
-         True, 1000, 2500, None),
-        ("RELEASE",       PLACE_J + [1.5],
-         False, 750, 1500, None),
-        ("PAN_BACK",      [0.0] + LIFT_J[1:] + [1.5],
-         False, 1500, 2000, (PLACE_PAN, 0.0, 1500)),
-        ("RETURN",        [0.0, 0.0, 0.0, 0.0, 0.0, 1.5],
-         False, 750, 1500, None),
-    ]
-
-    mujoco.mj_resetData(model, data)
-    data.ctrl[:6] = WAYPOINTS[0][1]
-    waypoint_idx = 0
+    phase = PHASE_SPAWN
+    episode = 0
+    scan_pan = SCAN_PAN_MIN
+    scan_dir = 1  # +1 = sweep right, -1 = sweep left
+    detected_pos = None
+    waypoints = []
+    wp_idx = 0
     step_in_wp = 0
 
-    print("[✓] Initialization complete. Launching viewer...")
-    print("    Run with:  mjpython autonomous_pick_place.py\n")
+    # Neutral scan pose: arm up, gripper open, ready to sweep
+    SCAN_JOINTS = [0.0, -0.5, 0.3, 1.0, 0.0, 1.5]  # arm slightly raised for scanning
+
+    print("[✓] Ready. Run with: mjpython autonomous_pick_place.py\n")
 
     try:
         with mujoco.viewer.launch_passive(model, data) as viewer:
@@ -163,13 +160,14 @@ def main():
             while viewer.is_running():
                 step_start = time.time()
 
-                # ─── VISION ───
+                # ─── VISION (every 25 steps) ───
                 if step_count % 25 == 0:
                     renderer.update_scene(data, camera="rgbd_cam")
                     img = renderer.render()
                     cv2_img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-                    if yolo_model is not None and waypoint_idx <= 3:
+                    # YOLO detection overlay
+                    if yolo_model is not None:
                         results = yolo_model(cv2_img, verbose=False)
                         if len(results) > 0 and len(results[0].boxes) > 0:
                             for box in results[0].boxes:
@@ -179,49 +177,192 @@ def main():
                                             (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX,
                                             0.4, (0, 255, 255), 1)
 
-                    df = densefusion_6d_inference(model, data)
+                    # HUD overlays
+                    cube_pos = data.xpos[cube_id]
+                    grip_pos = data.site_xpos[site_id]
                     cv2.putText(cv2_img,
-                                f"DF6D: [{df['pos'][0]:.3f}, {df['pos'][1]:.3f}, {df['pos'][2]:.3f}]",
-                                (10, 465), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 255), 1)
-
-                    gpos = data.site_xpos[site_id]
+                                f"Cube: [{cube_pos[0]:.3f}, {cube_pos[1]:.3f}, {cube_pos[2]:.3f}]",
+                                (10, 465), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
                     cv2.putText(cv2_img,
-                                f"Grip: [{gpos[0]:.3f}, {gpos[1]:.3f}, {gpos[2]:.3f}]",
+                                f"Grip: [{grip_pos[0]:.3f}, {grip_pos[1]:.3f}, {grip_pos[2]:.3f}]",
                                 (10, 448), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 0), 1)
-
-                    if waypoint_idx < len(WAYPOINTS):
+                    cv2.putText(cv2_img,
+                                f"Phase: {phase} | Episode: {episode}",
+                                (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    if phase == PHASE_SCAN:
                         cv2.putText(cv2_img,
-                                    f"Phase: {WAYPOINTS[waypoint_idx][0]} ({waypoint_idx+1}/{len(WAYPOINTS)})",
-                                    (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                                    f"Pan: {math.degrees(scan_pan):.1f} deg",
+                                    (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
 
-                # ─── WAYPOINT EXECUTION ───
-                if waypoint_idx < len(WAYPOINTS):
-                    name, ctrl, hold_cube, min_steps, max_steps, pan_interp = WAYPOINTS[waypoint_idx]
+                # ═══════════════════════════════════════
+                # ─── PHASE: SPAWN ───
+                # ═══════════════════════════════════════
+                if phase == PHASE_SPAWN:
+                    episode += 1
+                    # Reset arm to neutral
+                    data.qpos[:6] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                    data.ctrl[:6] = [0.0, 0.0, 0.0, 0.0, 0.0, 1.5]
+                    # Respawn cube at random location
+                    new_pos = respawn_cube(data, cube_qpos)
+                    # Re-enable collision
+                    model.geom_contype[cube_geom_id] = 1
+                    model.geom_conaffinity[cube_geom_id] = 1
+
+                    print(f"\n{'='*62}")
+                    print(f"🎲  EPISODE {episode}: Cube spawned at [{new_pos[0]:.3f}, {new_pos[1]:.3f}]")
+                    print(f"{'='*62}")
+
+                    # Initialize scan
+                    scan_pan = SCAN_PAN_MIN
+                    scan_dir = 1
+                    detected_pos = None
+                    phase = PHASE_SCAN
+                    step_in_wp = 0
+                    print(f"[🔍] Scanning for cube...")
+
+                # ═══════════════════════════════════════
+                # ─── PHASE: SCAN (sweep shoulder_pan) ──
+                # ═══════════════════════════════════════
+                elif phase == PHASE_SCAN:
+                    # Set arm to scan pose with current pan angle
+                    data.ctrl[0] = scan_pan
+                    data.ctrl[1:6] = SCAN_JOINTS[1:]
+
+                    # Directly set pan qpos for smooth sweep (bypass weak servo)
+                    data.qpos[0] = scan_pan
+                    data.qvel[0] = 0.0
+
+                    # Advance pan angle
+                    scan_pan += SCAN_SPEED * scan_dir
+                    if scan_pan >= SCAN_PAN_MAX:
+                        scan_pan = SCAN_PAN_MAX
+                        scan_dir = -1
+                    elif scan_pan <= SCAN_PAN_MIN:
+                        scan_pan = SCAN_PAN_MIN
+                        scan_dir = 1
+
+                    # Check detection: is the cube within the arm's reach arc?
+                    # Use ground-truth pose (DenseFusion stand-in)
+                    cube_pos = data.xpos[cube_id].copy()
+                    cube_pan = math.atan2(cube_pos[1], cube_pos[0])
+
+                    # "Detect" when the scan angle is close to the cube's angle
+                    pan_diff = abs(scan_pan - cube_pan)
+                    if pan_diff < math.radians(8):  # within 8° of cube direction
+                        detected_pos = cube_pos.copy()
+                        # Adjust Z to table height
+                        detected_pos[2] = 0.05 + CUBE_HALF_SIZE
+
+                        det_pan_deg = math.degrees(cube_pan)
+                        print(f"[✓] DETECTED cube at [{detected_pos[0]:.3f}, {detected_pos[1]:.3f}] "
+                              f"(pan={det_pan_deg:.1f}°)")
+
+                        # ─── SOLVE IK FOR DETECTED POSITION ───
+                        print(f"[*] Computing dynamic IK for detected position...")
+                        pan_hint = cube_pan
+
+                        GRAB_J = solve_ik(model, data, site_id, detected_pos, pan_hint)
+                        PRE_target = detected_pos.copy()
+                        PRE_target[0] -= 0.04 * math.cos(cube_pan)
+                        PRE_target[1] -= 0.04 * math.sin(cube_pan)
+                        PRE_J = solve_ik(model, data, site_id, PRE_target, pan_hint)
+
+                        LIFT_target = detected_pos.copy()
+                        LIFT_target[2] = 0.18
+                        LIFT_J = solve_ik(model, data, site_id, LIFT_target, pan_hint)
+
+                        PLACE_J = solve_ik(model, data, site_id, CUBE_PLACE_POS, 0.8)
+                        PLACE_LIFT_target = CUBE_PLACE_POS.copy()
+                        PLACE_LIFT_target[2] = 0.18
+                        PLACE_LIFT_J = solve_ik(model, data, site_id, PLACE_LIFT_target, 0.8)
+                        PLACE_PAN = PLACE_J[0]
+                        GRAB_PAN = GRAB_J[0]
+
+                        print(f"    GRAB pan={math.degrees(GRAB_PAN):.1f}° "
+                              f"joints={[f'{j:.3f}' for j in GRAB_J]}")
+                        print(f"    PLACE pan={math.degrees(PLACE_PAN):.1f}°")
+
+                        # Build dynamic waypoint sequence
+                        waypoints = [
+                            # First: pan to the cube's direction (from current scan position)
+                            ("PAN_TO_CUBE",
+                             [GRAB_PAN] + SCAN_JOINTS[1:],
+                             False, 800, 1500,
+                             (scan_pan, GRAB_PAN, 800)),
+
+                            ("PRE_APPROACH",
+                             PRE_J + [1.5],
+                             False, 750, 2500, None),
+
+                            ("GRAB_ADVANCE",
+                             GRAB_J + [1.5],
+                             False, 1000, 2500, None),
+
+                            ("CLOSE_GRIP",
+                             GRAB_J + [-0.10],
+                             True, 1000, 2000, None),
+
+                            ("LIFT",
+                             LIFT_J + [-0.10],
+                             True, 750, 2500, None),
+
+                            ("PAN_TO_PLACE",
+                             [PLACE_PAN] + LIFT_J[1:] + [-0.10],
+                             True, 1500, 2000,
+                             (GRAB_PAN, PLACE_PAN, 1500)),
+
+                            ("PLACE_LIFT",
+                             PLACE_LIFT_J + [-0.10],
+                             True, 1000, 2500, None),
+
+                            ("PLACE_LOWER",
+                             PLACE_J + [-0.10],
+                             True, 1000, 2500, None),
+
+                            ("RELEASE",
+                             PLACE_J + [1.5],
+                             False, 750, 1500, None),
+
+                            ("PAN_BACK",
+                             [0.0] + SCAN_JOINTS[1:],
+                             False, 1200, 2000,
+                             (PLACE_PAN, 0.0, 1200)),
+
+                            ("RETURN",
+                             [0.0, 0.0, 0.0, 0.0, 0.0, 1.5],
+                             False, 750, 1500, None),
+                        ]
+
+                        phase = PHASE_WAYPOINTS
+                        wp_idx = 0
+                        step_in_wp = 0
+                        print(f"[→] Phase 1/{len(waypoints)}: {waypoints[0][0]}")
+
+                # ═══════════════════════════════════════
+                # ─── PHASE: EXECUTE WAYPOINTS ──────────
+                # ═══════════════════════════════════════
+                elif phase == PHASE_WAYPOINTS and wp_idx < len(waypoints):
+                    name, ctrl, hold_cube, min_steps, max_steps, pan_interp = waypoints[wp_idx]
                     target = np.array(ctrl)
                     data.ctrl[:6] = ctrl
 
-                    # Smooth pan interpolation
+                    # Smooth pan interpolation (bypass weak servo)
                     if pan_interp is not None:
                         s_pan, e_pan, n_steps = pan_interp
                         t = min(step_in_wp / n_steps, 1.0)
-                        t = t * t * (3.0 - 2.0 * t)
+                        t = t * t * (3.0 - 2.0 * t)  # hermite ease
                         data.qpos[0] = s_pan + t * (e_pan - s_pan)
                         data.qvel[0] = 0.0
                         data.ctrl[0] = data.qpos[0]
 
-                    # ─── MAGNETIC GRASP ───
+                    # Magnetic grasp with collision toggle
                     if hold_cube:
-                        # Disable cube-robot collision during carry
                         model.geom_contype[cube_geom_id] = 0
                         model.geom_conaffinity[cube_geom_id] = 0
-                        # Lock cube position to gripper site
                         data.qpos[cube_qpos:cube_qpos + 3] = data.site_xpos[site_id]
-                        # Lock rotation (no spinning)
                         data.qpos[cube_qpos + 3:cube_qpos + 7] = [1, 0, 0, 0]
-                        # Zero all velocities (clean release)
                         data.qvel[cube_dof:cube_dof + 6] = 0
                     else:
-                        # Re-enable collision when not carrying
                         model.geom_contype[cube_geom_id] = 1
                         model.geom_conaffinity[cube_geom_id] = 1
 
@@ -234,17 +375,28 @@ def main():
                         max_err = np.max(np.abs(data.qpos[:6] - target))
 
                     if (max_err < 0.03 and step_in_wp >= min_steps) or step_in_wp >= max_steps:
-                        waypoint_idx += 1
+                        wp_idx += 1
                         step_in_wp = 0
-                        if waypoint_idx < len(WAYPOINTS):
-                            print(f"[→] Phase {waypoint_idx+1}/{len(WAYPOINTS)}: {WAYPOINTS[waypoint_idx][0]}")
+                        if wp_idx < len(waypoints):
+                            print(f"[→] Phase {wp_idx+1}/{len(waypoints)}: {waypoints[wp_idx][0]}")
                         else:
+                            # Episode complete
                             fc = data.xpos[cube_id]
                             err = np.linalg.norm(fc[:2] - CUBE_PLACE_POS[:2])
-                            print(f"[✓] ══════ EPISODE COMPLETE ══════")
+                            print(f"[✓] ══════ EPISODE {episode} COMPLETE ══════")
                             print(f"    Final cube: [{fc[0]:.4f}, {fc[1]:.4f}, {fc[2]:.4f}]")
-                            print(f"    Target:     [{CUBE_PLACE_POS[0]:.4f}, {CUBE_PLACE_POS[1]:.4f}, {CUBE_PLACE_POS[2]:.4f}]")
+                            print(f"    Target:     [{CUBE_PLACE_POS[0]:.4f}, {CUBE_PLACE_POS[1]:.4f}]")
                             print(f"    XY error:   {err*1000:.1f} mm")
+                            phase = PHASE_DONE
+                            step_in_wp = 0
+
+                # ═══════════════════════════════════════
+                # ─── PHASE: DONE → RESPAWN ─────────────
+                # ═══════════════════════════════════════
+                elif phase == PHASE_DONE:
+                    step_in_wp += 1
+                    if step_in_wp >= 1500:  # 3 second pause, then respawn
+                        phase = PHASE_SPAWN
 
                 # ─── STEP ───
                 mujoco.mj_step(model, data)
